@@ -1,0 +1,759 @@
+/**
+ *	Time Attack mode
+ */
+#Extends "Modes/TrackMania/Base/ModeTrackmania.Script.txt"
+
+#Const	CompatibleMapTypes	"Race"
+#Const	Version							"2017-05-30"
+#Const	ScriptName					"Modes/TrackMania/TimeAttack/Overtime.Script.txt"
+
+// ---------------------------------- //
+// Includes
+// ---------------------------------- //
+#Include "TextLib" as TL
+#Include "MathLib" as MathLib
+
+// ---------------------------------- //
+// Settings
+// ---------------------------------- //
+#Setting S_TimeLimit				300	as _("Time limit :") ///< Time limit before going to the next map
+#Setting S_WarmUpNb				0	as _("Number of warm up :")
+#Setting S_WarmUpDuration	0	as _("Duration of one warm up :")
+
+#Setting S_OvertimeActivated True as _("Overtime mode : Allow players to end their current run after time limit.")
+#Setting S_OvertimeLimit 15 as _("Overtime limit : Between 5 and 30")
+
+#Setting S_ScriptEnvironment "development"/*/"development"*/
+
+// ---------------------------------- //
+// Constants
+// ---------------------------------- //
+#Const Description _("""$fffIn $f00Overtime$fff mode, the goal is to set the $f00best time$fff.
+
+You have as many tries as you want, and you can $ff0retry$fff when you want by pressing the $ff0'Backspace'$fff key.
+
+When the time is up, the game switch to Overtime Mode : Each player which still runs can finish his race. However, respawn is no longer allowed.
+Once all players finished their race, the $f00winner$fff is the player with the $f00best time$fff.""")
+
+#Const C_HudModulePath "Nadeo/TrackMania/TimeAttack/Hud.Module.Gbx" ///< Path to the hud module
+#Const C_ManiaAppUrl "file://Media/ManiaApps/Nadeo/TrackMania/TimeAttack/TimeAttack.Script.txt"
+#Const C_BotsNb 0
+
+
+declare CUILayer m_SoundLayerFirst;
+declare CUILayer m_SlidersLayer;
+
+declare Boolean m_AnnouncerThirtySeconds;
+declare Boolean m_AnnouncerTenSeconds;
+
+declare Boolean m_OvertimeActivated;
+declare Boolean m_Overtime;
+
+declare Integer m_OvertimeLimit;
+
+***Match_LogVersion***
+***
+MB_LogVersion(ScriptName, Version);
+***
+
+***Match_Settings***
+***
+MB_Settings_UseDefaultHud = False;
+***
+
+***Match_Rules***
+***
+ModeInfo::SetName("Overtime");
+ModeInfo::SetType(ModeInfo::C_Type_FreeForAll);
+ModeInfo::SetRules(Description);
+ModeInfo::SetStatusMessage(_("TYPE: Free for all\nOBJECTIVE: Set the best time on the track."));
+***
+
+***Match_LoadHud***
+***
+ClientManiaAppUrl = C_ManiaAppUrl;
+Hud_Load(C_HudModulePath);
+MB_SortScores(CTmMode::ETmScoreSortOrder::BestRace_Time);
+
+// Initialize UI modules
+UI::LoadModules([
+	UIModules::C_Module_TimeGap, 
+	UIModules::C_Module_Chrono,
+	UIModules::C_Module_CheckpointTime,
+	UIModules::C_Module_PrevBestTime,
+	UIModules::C_Module_SpeedAndDistance,
+	UIModules::C_Module_Countdown,
+	UIModules::C_Module_MapInfo,
+	UIModules::C_Module_MapRanking,
+	UIModules::C_Module_LiveInfo,
+	UIModules::C_Module_SpectatorInfo
+]);
+UI::SetTimeGapMode("BestRace");
+UI::SetCheckpointTimeMode("BestRace");
+UI::SetIndependantLaps(True);
+***
+
+***Match_StartServer***
+***
+// Initialize mode
+UseClans = False;
+
+m_SoundLayerFirst = UIManager.UILayerCreate();
+UIManager.UIAll.UILayers.add(m_SoundLayerFirst);
+m_SoundLayerFirst.ManialinkPage = "";
+m_SlidersLayer = UIManager.UILayerCreate();
+UIManager.UIAll.UILayers.add(m_SlidersLayer);
+m_SlidersLayer.ManialinkPage = GetManiaLinkSliders();
+
+IndependantLaps = True;
+RespawnBehaviour::Set(CTmMode::ETMRespawnBehaviour::GiveUpBeforeFirstCheckPoint);
+WarmUp::SetAvailability(True);
+
+
+***
+
+***Match_InitMap***
+***
+
+declare netwrite Boolean Net_NextMap for Teams[0];
+declare netwrite Integer Net_InitTime for Teams[0];
+
+Net_NextMap = False;
+Net_InitTime = Now;
+foreach (Player in Players) {
+	PreparePlayer(Player);
+}
+
+//<gauge pos="0.5 0" z-index="2" size="83 10" halign="center" valign="center" drawbg="0" clan="0" ratio="0.5"/>
+declare Integer PrevTimeLimit;
+declare Integer StartTime;
+
+PlaySound("initMap", 0);
+
+declare Text authorMsg = "Author : $z" ^ Map.AuthorNickName ^ " $z(" ^ Map.AuthorLogin ^ ")";
+Message::SendStatusMessage(authorMsg, 5000, 3, CUIConfig::EUISound::Silence, 0);
+Message::SendBigMessage(MapName, 5000, 3, CUIConfig::EUISound::EndRound, 0);
+m_AnnouncerThirtySeconds = True;
+m_AnnouncerTenSeconds = True;
+
+RedefineOvertime();
+***
+
+***Match_StartMap***
+***
+// Add bot when necessary
+Users_SetNbFakeUsers(C_BotsNb, 0);
+
+// Warm up
+declare WarmUpDuration = S_WarmUpDuration * 1000;
+MB_WarmUp(S_WarmUpNb, WarmUpDuration);
+
+// Initialize race
+StartTime = Now + 3000;
+PrevTimeLimit = S_TimeLimit;
+SetTimeLimit(StartTime, S_TimeLimit);
+
+// Spawn players for the race
+foreach (Player in Players) {
+	TM::StartRace(Player, StartTime);
+}
+
+***
+
+***Match_PlayLoop***
+***
+
+TimerSound();
+// Manage events
+foreach (Event in PendingEvents) {
+	Events::Valid(Event);
+	
+	// Waypoint
+	if (Event.Type == CTmModeEvent::EType::WayPoint) {
+		declare Better = False;
+		RefreshOvertimeForPlayer(Event.Player);
+		if (Event.IsEndRace) {
+			Better = Scores::SetPlayerBestRaceIfBetter(Event.Player.Score, Event.Player.CurRace, CTmResult::ETmRaceResultCriteria::Time);
+			if (Better) Scores::SetPlayerBestLap(Event.Player.Score, Event.Player.CurRace);
+			Scores::SetPlayerPrevRace(Event.Player.Score, Event.Player.CurRace);
+			TM::EndRace(Event.Player);
+			TM::WaitRace(Event.Player);
+			OvertimeModeFinishedForThisPlayer(Event.Player);
+			MB_SortScores(CTmMode::ETmScoreSortOrder::BestRace_Time);
+		} else if (Event.IsEndLap) {
+			Better = Scores::SetPlayerBestLapIfBetter(Event.Player.Score, Event.Player.CurLap, CTmResult::ETmRaceResultCriteria::Time);
+			if (Better) Scores::SetPlayerBestRace(Event.Player.Score, Event.Player.CurLap);
+			Scores::SetPlayerPrevRace(Event.Player.Score, Event.Player.CurLap);
+			MB_SortScores(CTmMode::ETmScoreSortOrder::BestRace_Time);
+			if(m_Overtime){
+				TM::EndRace(Event.Player);
+				TM::WaitRace(Event.Player);
+				OvertimeModeFinishedForThisPlayer(Event.Player);
+			}
+		}
+		
+		if (Better && Event.Player != Null) {
+			foreach (Rank => Score in Scores) {
+				if (Score.Id == Event.Player.Score.Id) {
+					if (Rank <= 2) {
+						declare Message = "";
+						if (Rank == 0) {
+							//L16N [Time Attack] Message displayed when the player finishes the race in first place. %1 is the name of the player.
+							Message = _("$<%1$> takes 1st place!");
+						} else if (Rank == 1) {
+							//L16N [Time Attack] Message displayed when the player finishes the race in second place. %1 is the name of the player.
+							Message = _("$<%1$> takes 2nd place!");
+						} else if (Rank == 2) {
+							//L16N [Time Attack] Message displayed when the player finishes the race in third place. %1 is the name of the player.
+							Message = _("$<%1$> takes 3rd place!");
+						}
+						foreach (Player in AllPlayers) {
+							UI::SendLiveEvent(Player, TL::Compose(Message, Event.Player.User.Name), """file://Avatars/{{{Event.Player.User.Login}}}/Default""");
+						}
+					} else {
+						UI::SendLiveEvent(
+							Event.Player,
+							//L16N [Time Attack] Message displayed when the player finishes the race. %1 is the name of the player. %2 is its rank in the ranking.
+							TL::Compose(_("$<%1$> takes %2th place!"), Event.Player.User.Name, TL::ToText(Rank+1)),
+							"""file://Avatars/{{{Event.Player.User.Login}}}/Default"""
+						);
+					}
+					break;
+				}
+			}
+		}
+	}
+	// GiveUp
+	else if (Event.Type == CTmModeEvent::EType::GiveUp) {
+		if(Event.Player.RequestsSpectate){
+			PreparePlayer(Event.Player);
+		}			
+		TM::WaitRace(Event.Player);
+		OvertimeModeFinishedForThisPlayer(Event.Player);
+	}
+}
+
+//Overtime mode
+if(m_Overtime){
+	foreach(Player in Players){
+
+		declare Integer OvertimeLimit for Player;
+		
+		if(OvertimeLimit < Now){
+			TM::WaitRace(Player);
+		}			
+	}
+}
+
+declare netwrite Integer Net_OvertimeRunners for Teams[0];
+
+Net_OvertimeRunners = 0;
+//Update Net Values
+foreach(Player in Players){
+
+    declare UI <=> UIManager.GetUI(Player);    
+    declare Integer OvertimeLimit for Player;
+		declare Ident LayerSoundOvertimeId for Player;
+		declare CUILayer LayerSoundOvertime for Player;
+		
+    if(LayerSoundOvertimeId == NullId || LayerSoundOvertime == Null){
+    	PreparePlayer(Player);
+    }
+
+    declare Boolean OvertimeMode for Player;
+    declare netwrite Boolean Net_Overtime for UI;
+
+    Net_Overtime = OvertimeMode;
+
+    if(OvertimeMode){
+    	Net_OvertimeRunners += 1;
+    }
+
+    declare netwrite Real Net_OvertimeValue for UI;
+    
+    if(m_Overtime){
+         Net_OvertimeValue = (MathLib::ToReal(OvertimeLimit - Now)/1000.0)/m_OvertimeLimit;
+    } else {
+        Net_OvertimeValue = 1.0;
+    }
+}
+
+declare netwrite Integer Net_OvertimeMax for Teams[0];
+Net_OvertimeMax = m_OvertimeLimit;
+
+// Spawn players
+foreach (Player in Players) {
+	if (TM::IsWaiting(Player)) {
+		if(!m_OvertimeActivated){
+			TM::StartRace(Player);
+		} else {
+			if(!m_Overtime){
+				TM::StartRace(Player);
+			}
+		}
+	}
+}
+
+// Update the map duration setting
+if (PrevTimeLimit != S_TimeLimit) {
+	PrevTimeLimit = S_TimeLimit;
+	SetTimeLimit(StartTime, S_TimeLimit);
+}
+
+// End the map when time limit is reached
+if (CutOffTimeLimit > 0 && Now >= CutOffTimeLimit) {
+	if(m_OvertimeActivated && !m_Overtime){
+		m_Overtime = True;
+		Message::SendBigMessage("$iOvertime !", 2000, 3, CUIConfig::EUISound::EndRound, 0);
+		Message::SendStatusMessage("Don't give up ! You can still finish your run !", 5000, 3, CUIConfig::EUISound::Silence, 0);
+		foreach(Player in Players){
+			InitOvertimeForPlayer(Player);
+		}
+	}
+	if(!m_OvertimeActivated){
+		MB_StopMatch();
+	}
+	if(m_OvertimeActivated && m_Overtime){
+		declare Boolean AllPlayersFinished = True;
+		foreach(Player in Players){
+			if (!TM::IsWaiting(Player)) {
+				AllPlayersFinished = False;
+			}
+		}
+		if(AllPlayersFinished){
+			MB_StopMatch();
+		}
+	}
+}
+***
+
+***Match_EndMap***
+***
+// Ensure that we stop the match (after a vote for the next map, ...)
+m_Overtime = False;
+
+foreach(Player in Players){
+    declare Ident LayerSoundOvertimeId for Player;
+    declare CUILayer LayerSoundOvertime for Player;
+
+   	if(LayerSoundOvertimeId == NullId || LayerSoundOvertime == Null){
+    	PreparePlayer(Player);
+    }
+
+    declare netwrite Boolean OvertimeMode for Player;
+    OvertimeMode = False;
+    declare UI <=> UIManager.GetUI(Player);                
+    declare netwrite Boolean Net_Overtime for UI;
+    
+	LayerSoundOvertime.ManialinkPage = "";
+
+    Net_Overtime = OvertimeMode;
+}
+MB_StopMatch();
+PlaySound("nextMap", 0);
+declare netwrite Boolean Net_NextMap for Teams[0];
+declare netwrite Integer Net_InitTime for Teams[0];
+
+Net_NextMap = True;
+Net_InitTime = Now;
+
+CutOffTimeLimit = -1;
+MB_SortScores(CTmMode::ETmScoreSortOrder::BestRace_Time);
+Scores::SetDefaultLadderSort(Scores::C_Sort_BestRaceTime);
+Scores::SetPlayerWinner(Scores::GetBestPlayer(Scores::Sort_BestRaceTime(), Scores::Order_Ascending()));
+Scores::UnspawnLosers();
+MB_Sleep(1000);
+
+TM::WaitRaceAll();
+
+***
+
+// ---------------------------------- //
+// Functions
+// ---------------------------------- //
+// ---------------------------------- //
+Text GetManiaLinkOvertime(){
+	declare Text ML = """
+	<manialink version="3"><script><!--
+        #Include "MathLib" as MathLib
+        #Include "TextLib" as TextLib
+
+        Real Lerp(Real _Origin, Real _Destination, Real _Smooth){
+			declare Real x;
+			
+			x = _Origin;		
+
+			declare Real xDes;
+			
+			xDes = _Destination;
+			
+			declare xDiff = MathLib::Abs(xDes - x) / _Smooth;
+			
+
+			if(x < xDes){
+				if(xDiff > 0.001){
+					x += xDiff;
+				} else {
+					x = xDes;
+				}
+			}
+			if(x > xDes){
+				if(xDiff > 0.001){
+					x -= xDiff;
+				} else {
+					x = xDes;
+				}
+			}
+			return x;
+		}
+
+		main(){
+            declare overtimeFrame <=> Page.GetFirstChild("overtime");
+            declare overtimeRunnersFrame <=> Page.GetFirstChild("overtimeRunners");
+            declare CMlLabel overtimeRunnersCount <=> (Page.GetFirstChild("overtimeRunnersCount") as CMlLabel);
+			declare CMlGauge overtimeGauge <=> (Page.GetFirstChild("overtimeGauge") as CMlGauge);
+
+            declare netread Boolean Net_Overtime for UI;
+            declare netread Real Net_OvertimeValue for UI;
+
+            declare netread Integer Net_OvertimeRunners for Teams[0];
+            declare netread Boolean Net_NextMap for Teams[0];
+
+            while(True){
+            	overtimeRunnersCount.Value = "Overtime Runners : ";
+                overtimeRunnersCount.Value ^= TextLib::ToText(Net_OvertimeRunners);
+            	if(!Net_NextMap){
+	                if(Net_Overtime){
+	                	overtimeFrame.RelativePosition_V3 = <Lerp(overtimeFrame.RelativePosition_V3.X, 0.0, 20.0), Lerp(overtimeFrame.RelativePosition_V3.Y, 70.0, 20.0)>;
+	                	overtimeRunnersFrame.RelativePosition_V3 = <Lerp(overtimeRunnersFrame.RelativePosition_V3.X, -132.0, 20.0), Lerp(overtimeRunnersFrame.RelativePosition_V3.Y, 70.0, 20.0)>;
+	                    if(Net_OvertimeValue <=1.0 && Net_OvertimeValue >= 0.0){
+	                        overtimeGauge.Ratio = Net_OvertimeValue;
+	                    }
+	                } else {
+	                	overtimeFrame.RelativePosition_V3 = <Lerp(overtimeFrame.RelativePosition_V3.X, -300.0, 20.0), Lerp(overtimeFrame.RelativePosition_V3.Y, 70.0, 20.0)>;
+	                    overtimeGauge.Ratio = 1.0;
+	                }
+                } else {
+                	overtimeFrame.RelativePosition_V3 = <Lerp(overtimeFrame.RelativePosition_V3.X, -300.0, 20.0), Lerp(overtimeFrame.RelativePosition_V3.Y, 70.0, 20.0)>;
+                	overtimeRunnersFrame.RelativePosition_V3 = <Lerp(overtimeRunnersFrame.RelativePosition_V3.X, -300.0, 20.0), Lerp(overtimeRunnersFrame.RelativePosition_V3.Y, 70.0, 20.0)>;
+                }
+
+                yield;
+            }
+		}
+		--></script>
+        <frame id="overtime" pos="-300 70">
+			<quad pos="0 0" z-index="-1" size="86 8" bgcolor="5555" halign="center" valign="center"/>
+			<gauge id="overtimeGauge" pos="0 0" z-index="0" size="80 10" drawbg="0" halign="center" valign="center" ratio=".5"/>
+			<label pos="47 6 0" z-index="1" size="43 8" text="$s$iOvertime Limit" halign="right" style="TextTitleError"/>
+		</frame>
+		<frame id="overtimeRunners" pos="-300 70">
+			<quad pos="0 0" z-index="0" size="59 8" bgcolor="3E3E3E4A" halign="center" valign="center" rot="2"/>
+			<label id="overtimeRunnersCount" pos="0 0" z-index="1" size="59 10" text="Overtime Runners : ???" halign="center" valign="center" style="TextSubTitle1" rot="2"/>
+		</frame>
+	</manialink>""";
+
+	return ML;
+}
+
+Text GetManiaLinkSliders(){
+	declare Text ML = """
+	<manialink version="3"><script><!--
+	#Include "TextLib" as TextLib
+	#Include "MathLib" as MathLib
+	
+	Real Lerp(Real _Origin, Real _Destination, Real _Smooth){
+		declare Real x;
+		
+		x = _Origin;		
+
+		declare Real xDes;
+		
+		xDes = _Destination;
+		
+		declare xDiff = MathLib::Abs(xDes - x) / _Smooth;
+		
+
+		if(x < xDes){
+			if(xDiff > 0.001){
+				x += xDiff;
+			} else {
+				x = xDes;
+			}
+		}
+		if(x > xDes){
+			if(xDiff > 0.001){
+				x -= xDiff;
+			} else {
+				x = xDes;
+			}
+		}
+		return x;
+		}
+	
+	main(){
+		declare CMlQuad[] Sliders = [
+			(Page.GetFirstChild("Slider1") as CMlQuad),
+			(Page.GetFirstChild("Slider2") as CMlQuad),
+			(Page.GetFirstChild("Slider3") as CMlQuad),
+			(Page.GetFirstChild("Slider4") as CMlQuad),
+			(Page.GetFirstChild("Slider5") as CMlQuad),
+			(Page.GetFirstChild("Slider6") as CMlQuad),
+			(Page.GetFirstChild("Slider7") as CMlQuad),
+			(Page.GetFirstChild("Slider8") as CMlQuad),
+			(Page.GetFirstChild("Slider9") as CMlQuad),
+			(Page.GetFirstChild("Slider10") as CMlQuad),
+			(Page.GetFirstChild("Slider11") as CMlQuad),
+			(Page.GetFirstChild("Slider12") as CMlQuad),
+			(Page.GetFirstChild("Slider13") as CMlQuad),
+			(Page.GetFirstChild("Slider14") as CMlQuad),
+			(Page.GetFirstChild("Slider15") as CMlQuad),
+			(Page.GetFirstChild("Slider16") as CMlQuad),
+			(Page.GetFirstChild("Slider17") as CMlQuad),
+			(Page.GetFirstChild("Slider18") as CMlQuad),
+			(Page.GetFirstChild("Slider19") as CMlQuad),
+			(Page.GetFirstChild("Slider20") as CMlQuad),
+			(Page.GetFirstChild("Slider21") as CMlQuad),
+			(Page.GetFirstChild("Slider22") as CMlQuad),
+			(Page.GetFirstChild("Slider23") as CMlQuad),
+			(Page.GetFirstChild("Slider24") as CMlQuad),
+			(Page.GetFirstChild("Slider25") as CMlQuad),
+			(Page.GetFirstChild("Slider26") as CMlQuad),
+			(Page.GetFirstChild("Slider27") as CMlQuad),
+			(Page.GetFirstChild("Slider28") as CMlQuad),
+			(Page.GetFirstChild("Slider29") as CMlQuad),
+			(Page.GetFirstChild("Slider30") as CMlQuad),
+			(Page.GetFirstChild("Slider31") as CMlQuad),
+			(Page.GetFirstChild("Slider32") as CMlQuad),
+			(Page.GetFirstChild("Slider33") as CMlQuad),
+			(Page.GetFirstChild("Slider34") as CMlQuad),
+			(Page.GetFirstChild("Slider35") as CMlQuad),
+			(Page.GetFirstChild("Slider36") as CMlQuad),
+			(Page.GetFirstChild("Slider37") as CMlQuad),
+			(Page.GetFirstChild("Slider38") as CMlQuad),
+			(Page.GetFirstChild("Slider39") as CMlQuad),
+			(Page.GetFirstChild("Slider40") as CMlQuad)
+		];
+		
+
+		declare netread Boolean Net_NextMap for Teams[0];
+		declare netread Integer Net_InitTime for Teams[0];
+
+		declare Integer InitTime = -1;
+		declare Integer Init;
+
+		declare Smooth = 40.0;
+
+
+		foreach(Slider in Sliders){
+			Slider.ZIndex = -10.0;
+		}
+
+		while(True){
+			if(InitTime != Net_InitTime){
+				InitTime = Net_InitTime;
+				Init = Now;
+			}
+			if(!Net_NextMap){
+				declare index = 0;
+				foreach(Slider in Sliders){
+					if(Now > ((index*1000)*.05) + Init){
+						Slider.Size = <Slider.Size.X, Lerp(Slider.Size.Y, 0.0, Smooth)>;
+					}
+					index += 1;
+				}
+			} else {				
+				declare index = 0;
+				foreach(Slider in Sliders){
+					if(Now > ((index*2000)*.05) + Init){
+						Slider.Size = <Slider.Size.X, Lerp(Slider.Size.Y, 200.0, Smooth)>;
+						Slider.Opacity = Lerp(Slider.Opacity, 1.0, Smooth*2);
+					}
+					index += 1;
+				}
+			}
+			yield;
+		}
+	}
+	
+	--></script>
+	<quad id="Slider1" pos="-194.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider2" pos="-184.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider3" pos="-174.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider4" pos="-164.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider5" pos="-154.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider6" pos="-144.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider7" pos="-134.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider8" pos="-124.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider9" pos="-114.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider10" pos="-104.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider11" pos="-94.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider12" pos="-84.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider13" pos="-74.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider14" pos="-64.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider15" pos="-54.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider16" pos="-44.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider17" pos="-34.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider18" pos="-24.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider19" pos="-14.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider20" pos="-4.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" hidden="0" halign="center"/>
+	<quad id="Slider21" pos="4.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>
+	<quad id="Slider22" pos="14.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider23" pos="24.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider24" pos="34.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider25" pos="44.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider26" pos="54.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider27" pos="64.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider28" pos="74.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider29" pos="84.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider30" pos="94.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider31" pos="104.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider32" pos="114.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>
+	<quad id="Slider33" pos="124.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider34" pos="134.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider35" pos="144.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider36" pos="154.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider37" pos="164.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider38" pos="174.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider39" pos="184.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>	
+	<quad id="Slider40" pos="194.7 0" sizen="10 200" bgcolor="000F" rot="20" valign="center" halign="center" hidden="0"/>
+	</manialink>
+	""";
+
+	return ML;
+}
+
+Void PreparePlayer(CTmPlayer _Player){
+	declare UI <=> UIManager.GetUI(_Player);
+    declare netwrite Boolean Net_Overtime for UI;
+
+	declare Ident LayerSoundOvertimeId for _Player;
+	declare Ident LayerOvertimeId for _Player;
+	
+	declare CUILayer LayerSoundOvertime for _Player;
+	declare CUILayer LayerOvertime for _Player;
+
+	declare Boolean OvertimeMode for _Player;
+    OvertimeMode = False;
+	
+	if(UI.UILayers.existskey(LayerSoundOvertimeId)){
+		declare Removed = UI.UILayers.removekey(LayerSoundOvertimeId);
+	}
+	
+	if(UI.UILayers.existskey(LayerOvertimeId)){
+		declare Removed = UI.UILayers.removekey(LayerOvertimeId);
+	}
+	
+	LayerOvertime <=> UIManager.UILayerCreate();
+	LayerOvertimeId = LayerOvertime.Id;
+	UI.UILayers.add(UIManager.UILayers[LayerOvertimeId]);
+	LayerOvertime.ManialinkPage = GetManiaLinkOvertime();
+	
+	LayerSoundOvertime <=> UIManager.UILayerCreate();
+	LayerSoundOvertimeId = LayerSoundOvertime.Id;
+	UI.UILayers.add(UIManager.UILayers[LayerSoundOvertimeId]);
+	LayerSoundOvertime.ManialinkPage = "";
+
+	Net_Overtime = m_Overtime;
+}
+
+Void RedefineOvertime(){
+	m_OvertimeActivated = S_OvertimeActivated;
+	m_Overtime = False;
+	m_OvertimeLimit = S_OvertimeLimit;
+	if(m_OvertimeLimit < 5){
+		m_OvertimeLimit = 5;
+	}
+	if(m_OvertimeLimit > 30){
+		m_OvertimeLimit = 30;
+	}
+}
+
+Void InitOvertimeForPlayer(CTmPlayer _Player){
+	declare Integer OvertimeLimit for _Player;
+	
+    declare Ident LayerSoundOvertimeId for _Player;
+    declare CUILayer LayerSoundOvertime for _Player;
+
+    if(LayerSoundOvertimeId == NullId || LayerSoundOvertime == Null){
+    	PreparePlayer(_Player);
+    }
+	
+    declare Boolean OvertimeMode for _Player;
+    OvertimeMode = True;
+
+	OvertimeLimit = Now + (m_OvertimeLimit * 1000);    
+    
+    LayerSoundOvertime.ManialinkPage = """
+    <manialink version="2">
+        <audio looping="1" hidden="1" play="1" volume="5" data="http://163.172.46.16/sounds/overtime.ogg"/>
+    </manialink>
+    """;
+}
+
+Void RefreshOvertimeForPlayer(CTmPlayer _Player){
+	declare Integer OvertimeLimit for _Player;
+	OvertimeLimit = Now + (m_OvertimeLimit * 1000);
+}
+
+Void PlaySound(Text soundName, Integer variant){
+	m_SoundLayerFirst.ManialinkPage = """""";
+	
+	if(soundName == "30sec"){
+		m_SoundLayerFirst.ManialinkPage = """<manialink version="2">
+		<audio looping="0" hidden="1" play="1" volume="1" data="http://163.172.46.16/sounds/30s.ogg"/>
+		</manialink>""";
+	}
+	if(soundName == "10sec"){
+		m_SoundLayerFirst.ManialinkPage = """<manialink version="2">
+		<audio looping="0" hidden="1" play="1" volume="1.5" data="http://163.172.46.16/sounds/10s.ogg"/>
+		</manialink>""";
+	}
+	if(soundName == "nextMap"){
+		m_SoundLayerFirst.ManialinkPage = """<manialink version="2">
+		<audio looping="0" hidden="1" play="1" volume="1" data="http://163.172.46.16/sounds/playstationOut.ogg"/>        
+		</manialink>""";
+	}
+	if(soundName == "initMap"){
+		m_SoundLayerFirst.ManialinkPage = """<manialink version="2">
+		<audio looping="0" hidden="1" play="1" volume="1" data="http://163.172.46.16/sounds/playstationIn.ogg"/>        
+		</manialink>""";
+	}
+}
+
+Void SetTimeLimit(Integer _StartTime, Integer _NewTimeLimit) {
+	if (_NewTimeLimit <= 0) {
+		CutOffTimeLimit = -1;
+		if (Hud != Null) Hud.ScoresTable.SetFooterText(TL::Compose("%1 -", _("Time Limit :")));
+	} else {
+		CutOffTimeLimit = _StartTime + (S_TimeLimit * 1000);
+		if (Hud != Null) Hud.ScoresTable.SetFooterText(TL::Compose("%1 "^TL::TimeToText(S_TimeLimit*1000, False), _("Time Limit :")));
+	}
+}
+
+Void TimerSound(){
+	if((CutOffTimeLimit - Now) <= 31000 && m_AnnouncerThirtySeconds){
+		PlaySound("30sec", -1);
+		Message::SendBigMessage("$f0030 seconds left !", 3000, 3, CUIConfig::EUISound::EndRound, 0);
+		m_AnnouncerThirtySeconds = False;
+	}
+	if((CutOffTimeLimit - Now) <= 11000 && m_AnnouncerTenSeconds){
+		PlaySound("10sec", -1);
+		m_AnnouncerTenSeconds = False;
+	}
+	
+}
+
+Void OvertimeModeFinishedForThisPlayer(CTmPlayer _Player){
+	declare Ident LayerSoundOvertimeId for _Player;
+    declare CUILayer LayerSoundOvertime for _Player;
+
+    if(LayerSoundOvertimeId == NullId || LayerSoundOvertime == Null){
+    	PreparePlayer(_Player);
+    }
+	
+    declare Boolean OvertimeMode for _Player;
+    OvertimeMode = False;
+
+    LayerSoundOvertime.ManialinkPage = "";
+}
